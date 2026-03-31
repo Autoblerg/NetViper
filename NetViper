@@ -1,0 +1,289 @@
+/** @param {NS} ns **/
+export async function main(ns) {
+    ns.disableLog("ALL");
+
+    const HOME_RESERVE = 15;
+    const MONEY_OK = 0.75;
+    const SEC_MARGIN = 5;
+    const HACK_FRAC = 0.2;
+    const HUD_REFRESH = 100;
+
+    const workers = {
+        "hack.js": `/** @param {NS} ns **/ export async function main(ns){const t=ns.args[0];if(!t)return;await ns.hack(t);}`,
+        "grow.js": `/** @param {NS} ns **/ export async function main(ns){const t=ns.args[0];if(!t)return;await ns.grow(t);}`,
+        "weaken.js": `/** @param {NS} ns **/ export async function main(ns){const t=ns.args[0];if(!t)return;await ns.weaken(t);}`
+    };
+
+    function ensureWorkersHome() {
+        for (const [file, code] of Object.entries(workers)) ns.write(file, code, "w");
+    }
+
+    const scripts = { hack: "hack.js", grow: "grow.js", weaken: "weaken.js" };
+    const ram = {
+        hack: ns.getScriptRam(scripts.hack),
+        grow: ns.getScriptRam(scripts.grow),
+        weaken: ns.getScriptRam(scripts.weaken)
+    };
+
+    const seenRoot = new Set();
+    const seenBackdoor = new Set();
+    const hasScripts = new Set();
+    let lastWallet = ns.getPlayer().money;
+    let lastTime = performance.now();
+    let backdoorCursor = 0;
+    let lastTarget = "";
+    let currentProcess = "idle";
+    let backdoorTarget = "idle";
+    let backdoorStartTime = 0;
+    let backdoorExpectedTime = 0;
+    let backdoorPID = 0;
+
+    const BACKDOOR_WORKER = "backdoor-worker.js";
+    const BACKDOOR_WORKER_CODE = `/** @param {NS} ns **/
+export async function main(ns) {
+    const target = ns.args[0];
+    const path = JSON.parse(ns.args[1]);
+    for (const hop of path) ns.singularity.connect(hop);
+    await ns.singularity.installBackdoor();
+    ns.singularity.connect("home");
+    ns.tprint("backdoor installed on " + target);
+}`;
+
+    const scanAll = () => {
+        const out = new Set(["home"]), stack = ["home"];
+        while (stack.length) {
+            const cur = stack.pop();
+            for (const n of ns.scan(cur)) if (!out.has(n)) { out.add(n); stack.push(n); }
+        }
+        return [...out];
+    };
+
+    const bfsPath = target => {
+        const prev = { home: null }, q = ["home"];
+        while (q.length) {
+            const cur = q.shift();
+            for (const n of ns.scan(cur)) {
+                if (prev[n] !== undefined) continue;
+                prev[n] = cur;
+                if (n === target) {
+                    const path = [];
+                    for (let t = target; t; t = prev[t]) path.push(t);
+                    return path.reverse();
+                }
+                q.push(n);
+            }
+        }
+        return null;
+    };
+
+    async function ensureScripts(server) {
+        if (hasScripts.has(server)) return;
+        await ns.scp(Object.keys(workers), server);
+        hasScripts.add(server);
+    }
+
+    async function root(server) {
+        if (server === "home" || ns.hasRootAccess(server)) return;
+        if (ns.fileExists("BruteSSH.exe")) ns.brutessh(server);
+        if (ns.fileExists("FTPCrack.exe")) ns.ftpcrack(server);
+        if (ns.fileExists("relaySMTP.exe")) ns.relaysmtp(server);
+        if (ns.fileExists("HTTPWorm.exe")) ns.httpworm(server);
+        if (ns.fileExists("SQLInject.exe")) ns.sqlinject(server);
+        if (ns.getServerNumPortsRequired(server) <= ns.getServer(server).openPortCount) {
+            ns.nuke(server);
+            if (!seenRoot.has(server)) {
+                ns.tprint(`root gained on ${server}`);
+                seenRoot.add(server);
+            }
+        }
+    }
+
+    const isPlayerServer = s => {
+        const srv = ns.getServer(s);
+        return srv.purchasedByPlayer === true || s === "home" || s === "darkweb";
+    };
+
+    // Auto-backdoor using a separate worker script
+    function startBackdoor(servers) {
+        // check if worker is still running
+        if (backdoorPID > 0) {
+            if (ns.isRunning(backdoorPID)) return;
+            // worker finished
+            seenBackdoor.add(backdoorTarget);
+            backdoorCursor++;
+            backdoorTarget = "idle";
+            backdoorPID = 0;
+        }
+
+        if (!ns.singularity?.connect) return;
+
+        for (let i = 0; i < servers.length; i++) {
+            const idx = (backdoorCursor + i) % servers.length;
+            const s = servers[idx];
+            if (seenBackdoor.has(s) || isPlayerServer(s)) continue;
+
+            const srv = ns.getServer(s);
+            if (!srv.hasAdminRights || srv.backdoorInstalled) { seenBackdoor.add(s); continue; }
+            if (ns.getServerRequiredHackingLevel(s) > ns.getHackingLevel()) continue;
+
+            const path = bfsPath(s);
+            if (!path) continue;
+
+            // launch worker script
+            backdoorTarget = s;
+            backdoorStartTime = performance.now();
+            backdoorExpectedTime = ns.getHackTime(s);
+            backdoorPID = ns.exec(BACKDOOR_WORKER, "home", 1, s, JSON.stringify(path));
+            if (backdoorPID === 0) {
+                backdoorTarget = "idle";
+            }
+            break;
+        }
+    }
+
+    function freeThreads(server, process, reserve = 0) {
+        const freeRam = ns.getServerMaxRam(server) - ns.getServerUsedRam(server) - reserve;
+        return Math.max(0, Math.floor(freeRam / ram[process]));
+    }
+
+    function totalFreeThreads(servers, process) {
+        return servers.reduce((sum, s) => {
+            if (!ns.hasRootAccess(s)) return sum;
+            const reserve = s === "home" ? HOME_RESERVE : 0;
+            return sum + freeThreads(s, process, reserve);
+        }, 0);
+    }
+
+    async function dispatch(process, target, servers, needThreads) {
+        let remaining = needThreads;
+        for (const s of servers) {
+            if (!ns.hasRootAccess(s)) continue;
+            const reserve = s === "home" ? HOME_RESERVE : 0;
+            const th = Math.min(freeThreads(s, process, reserve), remaining);
+            if (th <= 0) continue;
+            await ensureScripts(s);
+            ns.exec(scripts[process], s, th, target);
+            remaining -= th;
+            if (remaining <= 0) break;
+        }
+    }
+
+    function calcNeeds(target) {
+        const srv = ns.getServer(target);
+        const weakenNeeded = Math.max(0, srv.hackDifficulty - srv.minDifficulty);
+        const weakenThreads = Math.max(1, Math.ceil(weakenNeeded / ns.weakenAnalyze(1, 1)));
+
+        const growFactor = srv.moneyMax / Math.max(1, srv.moneyAvailable);
+        const growThreads = Math.max(1, Math.ceil(ns.growthAnalyze(target, growFactor, 1)));
+
+        const take = srv.moneyAvailable * HACK_FRAC;
+        const hackThreads = (() => {
+            const th = ns.hackAnalyzeThreads(target, take);
+            return (isFinite(th) && th > 0) ? Math.ceil(th) : 1;
+        })();
+
+        return { weakenThreads, growThreads, hackThreads };
+    }
+
+    function pickTarget(servers) {
+        const hackLevel = ns.getHackingLevel();
+        let best = null, bestVal = 0;
+        for (const s of servers) {
+            if (!ns.hasRootAccess(s) || s === "home") continue;
+            if (ns.getServerRequiredHackingLevel(s) > hackLevel) continue;
+            const val = ns.getServerMaxMoney(s) / (ns.getServerMinSecurityLevel(s) + 1);
+            if (val > bestVal) { bestVal = val; best = s; }
+        }
+        return best;
+    }
+
+    function formatMoney(n) {
+        const suffixes = [
+            { val: 1e33, suf: "D" },
+            { val: 1e30, suf: "N" },
+            { val: 1e27, suf: "O" },
+            { val: 1e24, suf: "Sp" },
+            { val: 1e21, suf: "Sx" },
+            { val: 1e18, suf: "Qi" },
+            { val: 1e15, suf: "Qa" },
+            { val: 1e12, suf: "t" },
+            { val: 1e9, suf: "b" },
+            { val: 1e6, suf: "m" },
+            { val: 1e3, suf: "k" },
+        ];
+        for (const { val, suf } of suffixes) {
+            if (n >= val) return (n / val).toFixed(2) + suf;
+        }
+        return n.toFixed(2);
+    }
+
+    function drawHUD(target) {
+        const now = performance.now();
+        const wallet = ns.getPlayer().money;
+        const elapsed = (now - lastTime) / 1000;
+        const moneyPerSec = elapsed > 0 ? (wallet - lastWallet) / elapsed : 0;
+        lastWallet = wallet;
+        lastTime = now;
+
+        ns.clearLog();
+        ns.print(`target_server:${target}`);
+        ns.print(`current_process:${currentProcess}`);
+        ns.print(`$/s:${formatMoney(moneyPerSec)}`);
+        ns.print(`backdoor:${backdoorTarget}`);
+        if (backdoorPID > 0 && ns.isRunning(backdoorPID)) {
+            const bdElapsed = now - backdoorStartTime;
+            const pct = Math.min(100, (bdElapsed / backdoorExpectedTime) * 100);
+            ns.print(`backdoor_progress:${pct.toFixed(1)}%`);
+        }
+    }
+
+    ensureWorkersHome();
+    ns.write(BACKDOOR_WORKER, BACKDOOR_WORKER_CODE, "w");
+    ns.ui.openTail();
+
+    while (true) {
+        const servers = scanAll();
+        for (const s of servers) await root(s);
+
+        startBackdoor(servers);
+
+        const target = pickTarget(servers);
+        if (!target) {
+            currentProcess = "idle";
+            drawHUD("none");
+            await ns.sleep(HUD_REFRESH);
+            continue;
+        }
+
+        // decide which single process to run
+        const srv = ns.getServer(target);
+        const secAboveMin = srv.hackDifficulty - srv.minDifficulty;
+        const moneyPct = srv.moneyAvailable / srv.moneyMax;
+
+        let process;
+        if (secAboveMin > SEC_MARGIN) {
+            process = "weaken";
+        } else if (moneyPct < MONEY_OK) {
+            process = "grow";
+        } else {
+            process = "hack";
+        }
+        currentProcess = process;
+
+        // calculate threads needed for the chosen process
+        const { weakenThreads, growThreads, hackThreads } = calcNeeds(target);
+        const needed = process === "weaken" ? weakenThreads
+                     : process === "grow" ? growThreads
+                     : hackThreads;
+        const available = totalFreeThreads(servers, process);
+        const threads = Math.min(available, needed);
+
+        // always draw HUD every cycle
+        drawHUD(target);
+
+        // dispatch only the chosen process
+        if (threads > 0) await dispatch(process, target, servers, threads);
+
+        await ns.sleep(HUD_REFRESH);
+    }
+}

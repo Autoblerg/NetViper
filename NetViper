@@ -165,7 +165,7 @@ export async function main(ns) {
             backdoorTarget = s;
             backdoorStartTime = performance.now();
             backdoorExpectedTime = ns.getHackTime(s);
-            backdoorPID = ns.exec(BACKDOOR_WORKER, "home", 1, s, lastBackdoorTarget, JSON.stringify(path));
+            backdoorPID = ns.exec(BACKDOOR_WORKER, "home", 1, s, JSON.stringify(path));
             if (backdoorPID === 0) {
                 backdoorTarget = "idle";
             }

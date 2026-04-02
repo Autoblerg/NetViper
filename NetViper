@@ -59,8 +59,9 @@ export async function main(ns) {
         securityBreach: false,
         securityWarning: false,
         targetLost: false,
-        emergencyCooldown: 0 // cooldown cycles after declining emergency
-    }; // track for alerts
+        emergencyCooldown: 0
+    };
+    let lastBackdoorTarget = "none";
     let backdoorTarget = "idle";
     let backdoorStartTime = 0;
     let backdoorExpectedTime = 0;

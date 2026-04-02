@@ -7,11 +7,34 @@ export async function main(ns) {
     const SEC_MARGIN = 5;
     const HACK_FRAC = 0.2;
     const HUD_REFRESH = 100;
+    const MONEY_SAMPLE_TIME = 2000; // 2 seconds for stable money/s calculation
+
+    // Process mix configurations (ratios of hack:grow:weaken threads)
+    const PROCESS_MIX = {
+        1: { hack: 8, grow: 1, weaken: 1 },  // hack-heavy (mainly hack)
+        2: { hack: 1, grow: 8, weaken: 1 },  // grow-heavy (mainly grow)
+        3: { hack: 1, grow: 1, weaken: 8 }   // weaken-heavy (mainly weaken)
+    };
 
     const workers = {
-        "hack.js": `/** @param {NS} ns **/ export async function main(ns){const t=ns.args[0];if(!t)return;await ns.hack(t);}`,
-        "grow.js": `/** @param {NS} ns **/ export async function main(ns){const t=ns.args[0];if(!t)return;await ns.grow(t);}`,
-        "weaken.js": `/** @param {NS} ns **/ export async function main(ns){const t=ns.args[0];if(!t)return;await ns.weaken(t);}`
+        "hack.js": `/** @param {NS} ns **/
+export async function main(ns) {
+    const t = ns.args[0];
+    if (!t) return;
+    await ns.hack(t);
+}`,
+        "grow.js": `/** @param {NS} ns **/
+export async function main(ns) {
+    const t = ns.args[0];
+    if (!t) return;
+    await ns.grow(t);
+}`,
+        "weaken.js": `/** @param {NS} ns **/
+export async function main(ns) {
+    const t = ns.args[0];
+    if (!t) return;
+    await ns.weaken(t);
+}`
     };
 
     function ensureWorkersHome() {
@@ -28,8 +51,9 @@ export async function main(ns) {
     const seenRoot = new Set();
     const seenBackdoor = new Set();
     const hasScripts = new Set();
-    let lastWallet = ns.getPlayer().money;
-    let lastTime = performance.now();
+    let moneyHistory = []; // for smoothed money/s calculation
+    let lastMoneyCheck = 0;
+    let lastMoneyValue = 0;
     let backdoorCursor = 0;
     let lastTarget = "";
     let currentProcess = "idle";
@@ -155,16 +179,38 @@ export async function main(ns) {
     }
 
     async function dispatch(process, target, servers, needThreads) {
+        // Get all running scripts on all servers to avoid killing workers
+        const runningScripts = new Map(); // server -> Map(script -> threads)
+        
+        for (const s of servers) {
+            if (!ns.hasRootAccess(s)) continue;
+            runningScripts.set(s, new Map());
+            const processes = ns.ps(s);
+            for (const p of processes) {
+                if (p.filename === scripts[process] && p.args[0] === target) {
+                    const current = runningScripts.get(s).get(process) || 0;
+                    runningScripts.get(s).set(process, current + p.threads);
+                }
+            }
+        }
+
+        // Distribute only what's needed to fill RAM without killing existing workers
         let remaining = needThreads;
         for (const s of servers) {
             if (!ns.hasRootAccess(s)) continue;
-            const reserve = s === "home" ? HOME_RESERVE : 0;
-            const th = Math.min(freeThreads(s, process, reserve), remaining);
-            if (th <= 0) continue;
-            await ensureScripts(s);
-            ns.exec(scripts[process], s, th, target);
-            remaining -= th;
             if (remaining <= 0) break;
+            
+            const reserve = s === "home" ? HOME_RESERVE : 0;
+            const maxThreads = freeThreads(s, process, reserve);
+            const currentThreads = runningScripts.get(s).get(process) || 0;
+            const canAdd = maxThreads - currentThreads;
+            
+            if (canAdd <= 0) continue;
+            
+            const toAdd = Math.min(canAdd, remaining);
+            await ensureScripts(s);
+            ns.exec(scripts[process], s, toAdd, target);
+            remaining -= toAdd;
         }
     }
 
@@ -183,6 +229,37 @@ export async function main(ns) {
         })();
 
         return { weakenThreads, growThreads, hackThreads };
+    }
+
+    // Calculate threads needed for a specific process mix
+    function calcMixThreads(target, mixId) {
+        const base = calcNeeds(target);
+        const mix = PROCESS_MIX[mixId];
+        
+        // Find the limiting factor and scale proportionally
+        const totalRatio = mix.hack + mix.grow + mix.weaken;
+        
+        // For each type, calculate how many "units" we can run
+        const hackUnits = mix.hack > 0 ? base.hackThreads / mix.hack : Infinity;
+        const growUnits = mix.grow > 0 ? base.growThreads / mix.grow : Infinity;
+        const weakenUnits = mix.weaken > 0 ? base.weakenThreads / mix.weaken : Infinity;
+        
+        // Minimum units we can run with this mix
+        const maxUnits = Math.min(hackUnits, growUnits, weakenUnits);
+        
+        // Calculate actual threads for this mix
+        const threads = {
+            hack: Math.max(1, Math.floor(maxUnits * mix.hack)),
+            grow: Math.max(1, Math.floor(maxUnits * mix.grow)),
+            weaken: Math.max(1, Math.floor(maxUnits * mix.weaken))
+        };
+        
+        // Verify we meet minimum requirements
+        if (threads.weaken < 1) threads.weaken = 1;
+        if (threads.grow < 1) threads.grow = 1;
+        if (threads.hack < 1) threads.hack = 1;
+        
+        return threads;
     }
 
     function pickTarget(servers) {
@@ -220,10 +297,24 @@ export async function main(ns) {
     function drawHUD(target) {
         const now = performance.now();
         const wallet = ns.getPlayer().money;
-        const elapsed = (now - lastTime) / 1000;
-        const moneyPerSec = elapsed > 0 ? (wallet - lastWallet) / elapsed : 0;
-        lastWallet = wallet;
-        lastTime = now;
+        
+        // Track money history for smoothed $/s calculation
+        if (now - lastMoneyCheck >= MONEY_SAMPLE_TIME) {
+            const delta = wallet - lastMoneyValue;
+            const elapsed = (now - lastMoneyCheck) / 1000;
+            if (elapsed > 0 && delta > 0) {
+                moneyHistory.push(delta / elapsed);
+                // Keep only last 5 samples
+                if (moneyHistory.length > 5) moneyHistory.shift();
+            }
+            lastMoneyCheck = now;
+            lastMoneyValue = wallet;
+        }
+        
+        // Calculate average from history
+        const moneyPerSec = moneyHistory.length > 0 
+            ? moneyHistory.reduce((a, b) => a + b, 0) / moneyHistory.length 
+            : 0;
 
         ns.clearLog();
         ns.print(`target_server:${target}`);
@@ -255,34 +346,66 @@ export async function main(ns) {
             continue;
         }
 
-        // decide which single process to run
+        // Decide which process mix to use based on server state
         const srv = ns.getServer(target);
         const secAboveMin = srv.hackDifficulty - srv.minDifficulty;
         const moneyPct = srv.moneyAvailable / srv.moneyMax;
 
-        let process;
+        let processMix;
         if (secAboveMin > SEC_MARGIN) {
-            process = "weaken";
+            // Security too high - need weakening
+            processMix = 3; // weaken-heavy
         } else if (moneyPct < MONEY_OK) {
-            process = "grow";
+            // Money too low - need growing
+            processMix = 2; // grow-heavy
         } else {
-            process = "hack";
+            // Server is ready - hack it
+            processMix = 1; // hack-heavy
         }
-        currentProcess = process;
+        
+        // Set display name based on which process is dominant in mix
+        const mixInfo = PROCESS_MIX[processMix];
+        const maxType = mixInfo.hack >= mixInfo.grow && mixInfo.hack >= mixInfo.weaken ? "hack" 
+                      : mixInfo.grow >= mixInfo.weaken ? "grow" : "weaken";
+        currentProcess = `mix${processMix}-${maxType}`;
 
-        // calculate threads needed for the chosen process
-        const { weakenThreads, growThreads, hackThreads } = calcNeeds(target);
-        const needed = process === "weaken" ? weakenThreads
-                     : process === "grow" ? growThreads
-                     : hackThreads;
-        const available = totalFreeThreads(servers, process);
-        const threads = Math.min(available, needed);
+        // Calculate threads for the chosen mix
+        const mixThreads = calcMixThreads(target, processMix);
+        
+        // Get total available threads (scale by ratio)
+        const totalNeeded = mixThreads.hack + mixThreads.grow + mixThreads.weaken;
+        
+        // Calculate available capacity for each type
+        const availableHack = totalFreeThreads(servers, "hack");
+        const availableGrow = totalFreeThreads(servers, "grow");
+        const availableWeaken = totalFreeThreads(servers, "weaken");
+        
+        // Scale down proportionally if not enough of any type
+        const ratioHack = mixThreads.hack > 0 ? availableHack / mixThreads.hack : 1;
+        const ratioGrow = mixThreads.grow > 0 ? availableGrow / mixThreads.grow : 1;
+        const ratioWeaken = mixThreads.weaken > 0 ? availableWeaken / mixThreads.weaken : 1;
+        const minRatio = Math.min(ratioHack, ratioGrow, ratioWeaken, 1);
+        
+        const actualThreads = {
+            hack: Math.floor(mixThreads.hack * minRatio),
+            grow: Math.floor(mixThreads.grow * minRatio),
+            weaken: Math.floor(mixThreads.weaken * minRatio)
+        };
 
-        // always draw HUD every cycle
+        // Draw HUD every cycle
         drawHUD(target);
 
-        // dispatch only the chosen process
-        if (threads > 0) await dispatch(process, target, servers, threads);
+        // Dispatch all three script types - dispatch now adds only what's needed to reach target
+        // (never kills existing workers, fills unused RAM)
+        if (actualThreads.hack > 0) {
+            await dispatch("hack", target, servers, actualThreads.hack);
+        }
+        if (actualThreads.grow > 0) {
+            await dispatch("grow", target, servers, actualThreads.grow);
+        }
+        if (actualThreads.weaken > 0) {
+            await dispatch("weaken", target, servers, actualThreads.weaken);
+        }
 
         await ns.sleep(HUD_REFRESH);
     }

@@ -288,9 +288,20 @@ export async function main(ns) {
         return n.toFixed(2);
     }
 
-    function drawHUD(target, threadCounts = { hack: 0, grow: 0, weaken: 0 }, alertState = null) {
+    function drawHUD(target, threadCounts = { hack: 0, grow: 0, weaken: 0 }, alertState = null, serverData = null) {
         const now = performance.now();
         const wallet = ns.getPlayer().money;
+        
+        // Get server data if not provided
+        let srv = null;
+        let moneyPct = 0;
+        if (serverData) {
+            srv = serverData;
+            moneyPct = srv.moneyAvailable / srv.moneyMax;
+        } else if (target && target !== "none") {
+            srv = ns.getServer(target);
+            moneyPct = srv.moneyAvailable / srv.moneyMax;
+        }
         
         // Track money history for smoothed $/s calculation
         if (now - lastMoneyCheck >= MONEY_SAMPLE_TIME) {
@@ -318,8 +329,13 @@ export async function main(ns) {
 
         ns.clearLog();
         ns.print(`target_server:${target}`);
-        ns.print(`server_security:${srv.hackDifficulty.toFixed(1)}/${srv.minDifficulty}`);
-        ns.print(`server_money:${(moneyPct * 100).toFixed(1)}%`);
+        if (srv) {
+            ns.print(`server_security:${srv.hackDifficulty.toFixed(1)}/${srv.minDifficulty}`);
+            ns.print(`server_money:${(moneyPct * 100).toFixed(1)}%`);
+        } else {
+            ns.print(`server_security:--/--`);
+            ns.print(`server_money:--%`);
+        }
         // Status indicators
         const status = [];
         if (alertState.bankruptcy || alertState.bankruptcyWarning) status.push(alertState.bankruptcy ? "BANKRUPT" : "LOW $");
@@ -483,7 +499,7 @@ export async function main(ns) {
         }
 
         // Draw HUD every cycle
-        drawHUD(target, actualThreads, alertState);
+        drawHUD(target, actualThreads, alertState, srv);
 
         // Dispatch all three operations in parallel
         if (actualThreads.hack > 0) {

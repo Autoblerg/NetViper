@@ -3,15 +3,35 @@ export async function main(ns) {
     ns.disableLog("ALL");
 
     const HOME_RESERVE = 15;
-    const MONEY_OK = 0.75;
+    const MONEY_OK = 0.85; // Grow to 85% instead of 75% for buffer
+    const MONEY_WARN = 0.15; // Warning at 15%
+    const MONEY_CRIT = 0.01; // Critical at 1%
     const SEC_MARGIN = 5;
+    const SEC_WARN = 10; // Warning at min + 10
+    const SEC_CRIT = 15; // Critical at min + 15
     const HACK_FRAC = 0.2;
     const HUD_REFRESH = 100;
+    const MONEY_SAMPLE_TIME = 2000; // 2 seconds for stable money/s calculation
 
     const workers = {
-        "hack.js": `/** @param {NS} ns **/ export async function main(ns){const t=ns.args[0];if(!t)return;await ns.hack(t);}`,
-        "grow.js": `/** @param {NS} ns **/ export async function main(ns){const t=ns.args[0];if(!t)return;await ns.grow(t);}`,
-        "weaken.js": `/** @param {NS} ns **/ export async function main(ns){const t=ns.args[0];if(!t)return;await ns.weaken(t);}`
+        "hack.js": `/** @param {NS} ns **/
+export async function main(ns) {
+    const t = ns.args[0];
+    if (!t) return;
+    await ns.hack(t);
+}`,
+        "grow.js": `/** @param {NS} ns **/
+export async function main(ns) {
+    const t = ns.args[0];
+    if (!t) return;
+    await ns.grow(t);
+}`,
+        "weaken.js": `/** @param {NS} ns **/
+export async function main(ns) {
+    const t = ns.args[0];
+    if (!t) return;
+    await ns.weaken(t);
+}`
     };
 
     function ensureWorkersHome() {
@@ -28,11 +48,19 @@ export async function main(ns) {
     const seenRoot = new Set();
     const seenBackdoor = new Set();
     const hasScripts = new Set();
-    let lastWallet = ns.getPlayer().money;
-    let lastTime = performance.now();
+    let moneyHistory = []; // for smoothed money/s calculation
+    let lastMoneyCheck = 0;
+    let lastMoneyValue = 0;
     let backdoorCursor = 0;
     let lastTarget = "";
-    let currentProcess = "idle";
+    let alertState = { 
+        bankruptcy: false, 
+        bankruptcyWarning: false,
+        securityBreach: false,
+        securityWarning: false,
+        targetLost: false,
+        emergencyCooldown: 0 // cooldown cycles after declining emergency
+    }; // track for alerts
     let backdoorTarget = "idle";
     let backdoorStartTime = 0;
     let backdoorExpectedTime = 0;
@@ -42,11 +70,12 @@ export async function main(ns) {
     const BACKDOOR_WORKER_CODE = `/** @param {NS} ns **/
 export async function main(ns) {
     const target = ns.args[0];
-    const path = JSON.parse(ns.args[1]);
+    const path = JSON.parse(ns.args[1] || "[]");
+    ns.tprint("Installing backdoor on " + target);
     for (const hop of path) ns.singularity.connect(hop);
     await ns.singularity.installBackdoor();
     ns.singularity.connect("home");
-    ns.tprint("backdoor installed on " + target);
+    ns.tprint("Installed backdoor on " + target);
 }`;
 
     const scanAll = () => {
@@ -110,7 +139,9 @@ export async function main(ns) {
             if (ns.isRunning(backdoorPID)) return;
             // worker finished
             seenBackdoor.add(backdoorTarget);
+            const completedTarget = backdoorTarget; // save for next tracking
             backdoorCursor++;
+            lastBackdoorTarget = completedTarget;
             backdoorTarget = "idle";
             backdoorPID = 0;
         }
@@ -133,11 +164,20 @@ export async function main(ns) {
             backdoorTarget = s;
             backdoorStartTime = performance.now();
             backdoorExpectedTime = ns.getHackTime(s);
-            backdoorPID = ns.exec(BACKDOOR_WORKER, "home", 1, s, JSON.stringify(path));
+            backdoorPID = ns.exec(BACKDOOR_WORKER, "home", 1, s, lastBackdoorTarget, JSON.stringify(path));
             if (backdoorPID === 0) {
                 backdoorTarget = "idle";
             }
             break;
+        }
+    }
+
+    function killWorkers(servers, type = "all") {
+        for (const s of servers) {
+            if (!ns.serverExists(s)) continue;
+            ns.kill("hack.js", s);
+            ns.kill("grow.js", s);
+            ns.kill("weaken.js", s);
         }
     }
 
@@ -155,27 +195,57 @@ export async function main(ns) {
     }
 
     async function dispatch(process, target, servers, needThreads) {
+        // Get all running scripts on all servers to avoid killing workers
+        const runningScripts = new Map(); // server -> Map(script -> threads)
+        
+        for (const s of servers) {
+            if (!ns.hasRootAccess(s)) continue;
+            runningScripts.set(s, new Map());
+            const processes = ns.ps(s);
+            for (const p of processes) {
+                if (p.filename === scripts[process] && p.args[0] === target) {
+                    const current = runningScripts.get(s).get(process) || 0;
+                    runningScripts.get(s).set(process, current + p.threads);
+                }
+            }
+        }
+
+        // Distribute only what's needed to fill RAM without killing existing workers
         let remaining = needThreads;
         for (const s of servers) {
             if (!ns.hasRootAccess(s)) continue;
-            const reserve = s === "home" ? HOME_RESERVE : 0;
-            const th = Math.min(freeThreads(s, process, reserve), remaining);
-            if (th <= 0) continue;
-            await ensureScripts(s);
-            ns.exec(scripts[process], s, th, target);
-            remaining -= th;
             if (remaining <= 0) break;
+            
+            const reserve = s === "home" ? HOME_RESERVE : 0;
+            const maxThreads = freeThreads(s, process, reserve);
+            const currentThreads = runningScripts.get(s).get(process) || 0;
+            const canAdd = maxThreads - currentThreads;
+            
+            if (canAdd <= 0) continue;
+            
+            const toAdd = Math.min(canAdd, remaining);
+            await ensureScripts(s);
+            ns.exec(scripts[process], s, toAdd, target);
+            remaining -= toAdd;
         }
     }
 
     function calcNeeds(target) {
         const srv = ns.getServer(target);
-        const weakenNeeded = Math.max(0, srv.hackDifficulty - srv.minDifficulty);
-        const weakenThreads = Math.max(1, Math.ceil(weakenNeeded / ns.weakenAnalyze(1, 1)));
+        
+        // Weaken: only reduce security to min + SEC_MARGIN (keep buffer above min)
+        const targetSec = srv.minDifficulty + SEC_MARGIN;
+        const secToReduce = Math.max(0, srv.hackDifficulty - targetSec);
+        const weakenThreads = Math.max(1, Math.ceil(secToReduce / ns.weakenAnalyze(1, 1)));
 
-        const growFactor = srv.moneyMax / Math.max(1, srv.moneyAvailable);
-        const growThreads = Math.max(1, Math.ceil(ns.growthAnalyze(target, growFactor, 1)));
+        // Grow: only grow to MONEY_OK (75%), not 100%
+        const targetMoney = srv.moneyMax * MONEY_OK;
+        const growFactor = targetMoney / Math.max(1, srv.moneyAvailable);
+        const growThreads = growFactor > 1 
+            ? Math.max(1, Math.ceil(ns.growthAnalyze(target, growFactor, 1)))
+            : 0;
 
+        // Hack: max threads for income (steal 20% of current money)
         const take = srv.moneyAvailable * HACK_FRAC;
         const hackThreads = (() => {
             const th = ns.hackAnalyzeThreads(target, take);
@@ -217,18 +287,51 @@ export async function main(ns) {
         return n.toFixed(2);
     }
 
-    function drawHUD(target) {
+    function drawHUD(target, threadCounts = { hack: 0, grow: 0, weaken: 0 }, alertState = null) {
         const now = performance.now();
         const wallet = ns.getPlayer().money;
-        const elapsed = (now - lastTime) / 1000;
-        const moneyPerSec = elapsed > 0 ? (wallet - lastWallet) / elapsed : 0;
-        lastWallet = wallet;
-        lastTime = now;
+        
+        // Track money history for smoothed $/s calculation
+        if (now - lastMoneyCheck >= MONEY_SAMPLE_TIME) {
+            const delta = wallet - lastMoneyValue;
+            const elapsed = (now - lastMoneyCheck) / 1000;
+            if (elapsed > 0 && delta > 0) {
+                moneyHistory.push(delta / elapsed);
+                // Keep only last 5 samples
+                if (moneyHistory.length > 5) moneyHistory.shift();
+            }
+            lastMoneyCheck = now;
+            lastMoneyValue = wallet;
+        }
+        
+        // Calculate average from history
+        const moneyPerSec = moneyHistory.length > 0 
+            ? moneyHistory.reduce((a, b) => a + b, 0) / moneyHistory.length 
+            : 0;
+
+        // Calculate worker distribution percentages
+        const total = threadCounts.hack + threadCounts.grow + threadCounts.weaken;
+        const hackPct = total > 0 ? Math.round((threadCounts.hack / total) * 100) : 0;
+        const growPct = total > 0 ? Math.round((threadCounts.grow / total) * 100) : 0;
+        const weakenPct = total > 0 ? Math.round((threadCounts.weaken / total) * 100) : 0;
 
         ns.clearLog();
         ns.print(`target_server:${target}`);
-        ns.print(`current_process:${currentProcess}`);
+        ns.print(`server_security:${srv.hackDifficulty.toFixed(1)}/${srv.minDifficulty}`);
+        ns.print(`server_money:${(moneyPct * 100).toFixed(1)}%`);
+        // Status indicators
+        const status = [];
+        if (alertState.bankruptcy || alertState.bankruptcyWarning) status.push(alertState.bankruptcy ? "BANKRUPT" : "LOW $");
+        if (alertState.securityBreach || alertState.securityWarning) status.push(alertState.securityBreach ? "SEC-BREACH" : "HIGH SEC");
+        if (status.length > 0) {
+            ns.print(`status:${status.join(" | ")}`);
+        } else {
+            ns.print(`status:stable`);
+        }
         ns.print(`$/s:${formatMoney(moneyPerSec)}`);
+        ns.print(`hack:${hackPct}%`);
+        ns.print(`grow:${growPct}%`);
+        ns.print(`weaken:${weakenPct}%`);
         ns.print(`backdoor:${backdoorTarget}`);
         if (backdoorPID > 0 && ns.isRunning(backdoorPID)) {
             const bdElapsed = now - backdoorStartTime;
@@ -250,39 +353,147 @@ export async function main(ns) {
         const target = pickTarget(servers);
         if (!target) {
             currentProcess = "idle";
-            drawHUD("none");
+            drawHUD("none", { hack: 0, grow: 0, weaken: 0 });
             await ns.sleep(HUD_REFRESH);
             continue;
         }
 
-        // decide which single process to run
+        // Alert when switching to a new target
+        if (target !== lastTarget) {
+            // Check if previous target became invalid (lost)
+            if (lastTarget && servers.includes(lastTarget)) {
+                const prevSrv = ns.getServer(lastTarget);
+                const canHack = prevSrv.hasAdminRights && prevSrv.moneyMax > 0 && prevSrv.requiredHackingLevel <= ns.getHackingLevel();
+                if (!canHack && !alertState.targetLost) {
+                    ns.tprint(`TARGET LOST: ${lastTarget}`);
+                    alertState.targetLost = true;
+                }
+            }
+            ns.tprint(`TARGET: ${lastTarget || 'none'} → ${target}`);
+            lastTarget = target;
+            alertState.targetLost = false;
+        }
+
+        // Calculate threads needed for all three operations based on server state
         const srv = ns.getServer(target);
         const secAboveMin = srv.hackDifficulty - srv.minDifficulty;
         const moneyPct = srv.moneyAvailable / srv.moneyMax;
 
-        let process;
-        if (secAboveMin > SEC_MARGIN) {
-            process = "weaken";
-        } else if (moneyPct < MONEY_OK) {
-            process = "grow";
-        } else {
-            process = "hack";
+        // Check alert conditions
+        const money = srv.moneyAvailable;
+        
+        // Money warnings
+        const moneyCritical = moneyPct < MONEY_CRIT;
+        const moneyWarning = moneyPct < MONEY_WARN;
+        
+        if (moneyCritical && !alertState.bankruptcy) {
+            ns.tprint(`CRITICAL: Bankruptcy on ${target} (${(moneyPct * 100).toFixed(1)}%)`);
+            alertState.bankruptcy = true;
+        } else if (moneyWarning && !alertState.bankruptcyWarning) {
+            ns.tprint(`WARNING: Low money on ${target} (${(moneyPct * 100).toFixed(1)}%)`);
+            alertState.bankruptcyWarning = true;
+        } else if (moneyPct >= MONEY_WARN) {
+            alertState.bankruptcyWarning = false;
+            alertState.bankruptcy = false;
         }
-        currentProcess = process;
+        
+        // Security warnings
+        const securityCritical = secAboveMin > SEC_CRIT;
+        const securityWarning = secAboveMin > SEC_WARN;
+        
+        if (securityCritical && !alertState.securityBreach) {
+            ns.tprint(`CRITICAL: Security breach on ${target} (+${secAboveMin.toFixed(1)})`);
+            alertState.securityBreach = true;
+        } else if (securityWarning && !alertState.securityWarning) {
+            ns.tprint(`WARNING: High security on ${target} (+${secAboveMin.toFixed(1)})`);
+            alertState.securityWarning = true;
+        } else if (secAboveMin <= SEC_WARN) {
+            alertState.securityWarning = false;
+            alertState.securityBreach = false;
+        }
 
-        // calculate threads needed for the chosen process
+        // Get ideal thread counts for each operation from calcNeeds
         const { weakenThreads, growThreads, hackThreads } = calcNeeds(target);
-        const needed = process === "weaken" ? weakenThreads
-                     : process === "grow" ? growThreads
-                     : hackThreads;
-        const available = totalFreeThreads(servers, process);
-        const threads = Math.min(available, needed);
 
-        // always draw HUD every cycle
-        drawHUD(target);
+        // Get available threads for each type
+        const availableHack = totalFreeThreads(servers, "hack");
+        const availableGrow = totalFreeThreads(servers, "grow");
+        const availableWeaken = totalFreeThreads(servers, "weaken");
 
-        // dispatch only the chosen process
-        if (threads > 0) await dispatch(process, target, servers, threads);
+        // Scale each proportionally to available RAM while keeping ratios
+        // This ensures we use all available RAM efficiently
+        const ratioHack = availableHack / Math.max(1, hackThreads);
+        const ratioGrow = availableGrow / Math.max(1, growThreads);
+        const ratioWeaken = availableWeaken / Math.max(1, weakenThreads);
+        
+        // Use the minimum ratio to scale all down proportionally
+        const minRatio = Math.min(ratioHack, ratioGrow, ratioWeaken, 1);
+
+        const actualThreads = {
+            hack: Math.floor(hackThreads * minRatio),
+            grow: Math.floor(growThreads * minRatio),
+            weaken: Math.floor(weakenThreads * minRatio)
+        };
+
+        // Emergency protocol: critical state → only weaken (and grow if money low)
+        if (alertState.emergencyCooldown > 0) {
+            alertState.emergencyCooldown--;
+        }
+        if ((alertState.bankruptcy || alertState.securityBreach) && alertState.emergencyCooldown === 0) {
+            const reason = alertState.bankruptcy && alertState.securityBreach 
+                ? "bankruptcy AND security breach" 
+                : alertState.bankruptcy ? "bankruptcy" : "security breach";
+            const proceed = await ns.prompt(`EMERGENCY: ${reason} - Execute recovery?`);
+            if (!proceed) {
+                // User declined - set cooldown (30 cycles = 3 seconds)
+                alertState.emergencyCooldown = 30;
+                ns.tprint("User rejected emergency - continuing normal ops");
+            } else {
+                ns.tprint("Executing emergency recovery...");
+                // Kill all workers first
+                killWorkers(servers);
+                // Handle both if present
+                if (alertState.bankruptcy && alertState.securityBreach) {
+                    // Both: 50% grow / 50% weaken
+                    const emergencyThreads = {
+                        hack: 0,
+                        grow: Math.floor(availableGrow * 0.5),
+                        weaken: Math.floor(availableWeaken * 0.5)
+                    };
+                    Object.assign(actualThreads, emergencyThreads);
+                } else if (alertState.securityBreach) {
+                    // Only weaken for security breach
+                    const emergencyThreads = {
+                        hack: 0,
+                        grow: 0,
+                        weaken: availableWeaken
+                    };
+                    Object.assign(actualThreads, emergencyThreads);
+                } else {
+                    // Bankrupt only: 10:2 ratio (83%/17%)
+                    const emergencyThreads = {
+                        hack: 0,
+                        grow: Math.floor(availableGrow * 0.83),
+                        weaken: Math.floor(availableWeaken * 0.17)
+                    };
+                    Object.assign(actualThreads, emergencyThreads);
+                }
+            }
+        }
+
+        // Draw HUD every cycle
+        drawHUD(target, actualThreads, alertState);
+
+        // Dispatch all three operations in parallel
+        if (actualThreads.hack > 0) {
+            await dispatch("hack", target, servers, actualThreads.hack);
+        }
+        if (actualThreads.grow > 0) {
+            await dispatch("grow", target, servers, actualThreads.grow);
+        }
+        if (actualThreads.weaken > 0) {
+            await dispatch("weaken", target, servers, actualThreads.weaken);
+        }
 
         await ns.sleep(HUD_REFRESH);
     }

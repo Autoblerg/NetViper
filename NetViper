@@ -4,8 +4,8 @@ export async function main(ns) {
 
     const HOME_RESERVE = 15;
     const MONEY_OK = 0.85; // Grow to 85% instead of 75% for buffer
-    const MONEY_WARN = 0.15; // Warning at 15%
-    const MONEY_CRIT = 0.01; // Critical at 1%
+    const MONEY_WARN = 0.20; // Warning at 20%
+    const MONEY_CRIT = 0.10; // Critical at 10%
     const SEC_MARGIN = 5;
     const SEC_WARN = 10; // Warning at min + 10
     const SEC_CRIT = 15; // Critical at min + 15

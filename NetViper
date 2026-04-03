@@ -4,8 +4,6 @@ export async function main(ns) {
 
     const HOME_RESERVE = 15;
     const MONEY_OK = 0.85; // Grow to 85% instead of 75% for buffer
-    const MONEY_WARN = 0.20; // Warning at 20%
-    const MONEY_CRIT = 0.10; // Critical at 10%
     const HACK_FRAC = 0.2;
     const SEC_MARGIN = 5;
     const HUD_REFRESH = 100;
@@ -51,16 +49,6 @@ export async function main(ns) {
     let lastMoneyValue = 0;
     let backdoorCursor = 0;
     let lastTarget = "";
-    let alertState = { 
-        bankruptcy: false, 
-        bankruptcyWarning: false,
-        securityBreach: false,
-        securityWarning: false,
-        targetLost: false,
-        emergencyCooldown: 0,
-        bankruptcyPrompted: false,
-        securityBreachPrompted: false
-    };
     let lastBackdoorTarget = "none";
     let backdoorTarget = "idle";
     let backdoorStartTime = 0;
@@ -285,7 +273,7 @@ export async function main(ns) {
         return n.toFixed(2);
     }
 
-    function drawHUD(target, threadCounts = { hack: 0, grow: 0, weaken: 0 }, alertState = null, serverData = null) {
+    function drawHUD(target, threadCounts = { hack: 0, grow: 0, weaken: 0 }, serverData = null) {
         const now = performance.now();
         const wallet = ns.getPlayer().money;
         
@@ -334,14 +322,7 @@ export async function main(ns) {
             ns.print(`server_money:--%`);
         }
         // Status indicators
-        const status = [];
-        if (alertState.bankruptcy || alertState.bankruptcyWarning) status.push(alertState.bankruptcy ? "BANKRUPT" : "LOW $");
-        if (alertState.securityBreach || alertState.securityWarning) status.push(alertState.securityBreach ? "SEC-BREACH" : "HIGH SEC");
-        if (status.length > 0) {
-            ns.print(`status:${status.join(" | ")}`);
-        } else {
-            ns.print(`status:stable`);
-        }
+        ns.print(`status:stable`);
         ns.print(`$/s:${formatMoney(moneyPerSec)}`);
         ns.print(`hack:${hackPct}%`);
         ns.print(`grow:${growPct}%`);
@@ -373,65 +354,13 @@ export async function main(ns) {
 
         // Alert when switching to a new target
         if (target !== lastTarget) {
-            // Check if previous target became invalid (lost)
-            if (lastTarget && servers.includes(lastTarget)) {
-                const prevSrv = ns.getServer(lastTarget);
-                const canHack = prevSrv.hasAdminRights && prevSrv.moneyMax > 0 && prevSrv.requiredHackingLevel <= ns.getHackingLevel();
-                if (!canHack && !alertState.targetLost) {
-                    ns.tprint(`TARGET LOST: ${lastTarget}`);
-                    alertState.targetLost = true;
-                }
-            }
             ns.tprint(`TARGET: ${lastTarget || 'none'} → ${target}`);
             lastTarget = target;
-            alertState.targetLost = false;
         }
 
         // Calculate threads needed for all three operations based on server state
         const srv = ns.getServer(target);
-        const secAboveMin = srv.hackDifficulty - srv.minDifficulty;
-        const moneyPct = srv.moneyAvailable / srv.moneyMax;
         
-        // Security thresholds adapt based on current server's difficulty range
-        const secRange = srv.maxDifficulty - srv.minDifficulty;
-        const SEC_WARN = srv.minDifficulty + secRange * 0.25; // 25% toward max
-        const SEC_CRIT = srv.minDifficulty + secRange * 0.5;  // 50% toward max
-
-        // Check alert conditions
-        const money = srv.moneyAvailable;
-        
-        // Money warnings - only show warning if NOT in critical state
-        const moneyCritical = moneyPct < MONEY_CRIT;
-        const moneyWarning = !moneyCritical && moneyPct < MONEY_WARN;
-        
-        if (moneyCritical && !alertState.bankruptcy) {
-            ns.tprint(`CRITICAL: Bankruptcy on ${target} (${(moneyPct * 100).toFixed(1)}%)`);
-            alertState.bankruptcy = true;
-        } else if (moneyWarning && !alertState.bankruptcyWarning) {
-            ns.tprint(`WARNING: Low money on ${target} (${(moneyPct * 100).toFixed(1)}%)`);
-            alertState.bankruptcyWarning = true;
-        } else if (moneyPct >= MONEY_WARN) {
-            alertState.bankruptcyWarning = false;
-            alertState.bankruptcy = false;
-            alertState.bankruptcyPrompted = false; // Reset when normalized
-        }
-        
-        // Security warnings - only show warning if NOT in critical state
-        const securityCritical = secAboveMin > SEC_CRIT;
-        const securityWarning = !securityCritical && secAboveMin > SEC_WARN;
-        
-        if (securityCritical && !alertState.securityBreach) {
-            ns.tprint(`CRITICAL: Security breach on ${target} (+${secAboveMin.toFixed(1)})`);
-            alertState.securityBreach = true;
-        } else if (securityWarning && !alertState.securityWarning) {
-            ns.tprint(`WARNING: High security on ${target} (+${secAboveMin.toFixed(1)})`);
-            alertState.securityWarning = true;
-        } else if (secAboveMin <= SEC_WARN) {
-            alertState.securityWarning = false;
-            alertState.securityBreach = false;
-            alertState.securityBreachPrompted = false; // Reset when normalized
-        }
-
         // Get ideal thread counts for each operation from calcNeeds
         const { weakenThreads, growThreads, hackThreads } = calcNeeds(target);
 
@@ -455,62 +384,8 @@ export async function main(ns) {
             weaken: Math.floor(weakenThreads * minRatio)
         };
 
-        // Emergency protocol: automatically adjust workers when in critical state
-        if (alertState.emergencyCooldown > 0) {
-            alertState.emergencyCooldown--;
-        }
-        
-        // Auto-adjust workers in critical state (without waiting for prompt)
-        if (alertState.bankruptcy || alertState.securityBreach) {
-            // Kill all workers first for clean slate
-            killWorkers(servers);
-            
-            // Handle both if present
-            if (alertState.bankruptcy && alertState.securityBreach) {
-                // Both: 50% grow / 50% weaken
-                actualThreads.hack = 0;
-                actualThreads.grow = Math.floor(availableGrow * 0.5);
-                actualThreads.weaken = Math.floor(availableWeaken * 0.5);
-            } else if (alertState.securityBreach) {
-                // Only weaken for security breach
-                actualThreads.hack = 0;
-                actualThreads.grow = 0;
-                actualThreads.weaken = availableWeaken;
-            } else {
-                // Bankrupt only: 10:2 ratio (83%/17%)
-                actualThreads.hack = 0;
-                actualThreads.grow = Math.floor(availableGrow * 0.83);
-                actualThreads.weaken = Math.floor(availableWeaken * 0.17);
-            }
-            // Skip normal dispatch - emergency mode handles it below
-        }
-        
-        // Prompt only if not yet prompted for this alert event
-        const showPrompt = (
-            (alertState.bankruptcy && !alertState.bankruptcyPrompted) || 
-            (alertState.securityBreach && !alertState.securityBreachPrompted)
-        ) && alertState.emergencyCooldown === 0;
-        
-        if (showPrompt) {
-            const reason = alertState.bankruptcy && alertState.securityBreach 
-                ? "bankruptcy AND security breach" 
-                : alertState.bankruptcy ? "bankruptcy" : "security breach";
-            const proceed = await ns.prompt(`EMERGENCY: ${reason} - Execute recovery?`);
-            // Mark as prompted
-            if (alertState.bankruptcy) alertState.bankruptcyPrompted = true;
-            if (alertState.securityBreach) alertState.securityBreachPrompted = true;
-            
-            if (!proceed) {
-                // User declined - set cooldown (30 cycles = 3 seconds)
-                alertState.emergencyCooldown = 30;
-                ns.tprint("User rejected emergency - continuing emergency ops");
-            } else {
-                ns.tprint("User accepted recovery - continuing emergency ops");
-            }
-        }
-
         // Draw HUD every cycle
-        drawHUD(target, actualThreads, alertState, srv);
+        drawHUD(target, actualThreads, srv);
 
         // Dispatch all three operations in parallel
         if (actualThreads.hack > 0) {

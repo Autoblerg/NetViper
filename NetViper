@@ -6,10 +6,8 @@ export async function main(ns) {
     const MONEY_OK = 0.85; // Grow to 85% instead of 75% for buffer
     const MONEY_WARN = 0.20; // Warning at 20%
     const MONEY_CRIT = 0.10; // Critical at 10%
-    const SEC_MARGIN = 5;
-    const SEC_WARN = 10; // Warning at min + 10
-    const SEC_CRIT = 15; // Critical at min + 15
     const HACK_FRAC = 0.2;
+    const SEC_MARGIN = 5;
     const HUD_REFRESH = 100;
     const MONEY_SAMPLE_TIME = 2000; // 2 seconds for stable money/s calculation
 
@@ -397,6 +395,11 @@ export async function main(ns) {
         const srv = ns.getServer(target);
         const secAboveMin = srv.hackDifficulty - srv.minDifficulty;
         const moneyPct = srv.moneyAvailable / srv.moneyMax;
+        
+        // Security thresholds adapt based on current server's difficulty range
+        const secRange = srv.maxDifficulty - srv.minDifficulty;
+        const SEC_WARN = srv.minDifficulty + secRange * 0.25; // 25% toward max
+        const SEC_CRIT = srv.minDifficulty + secRange * 0.5;  // 50% toward max
 
         // Check alert conditions
         const money = srv.moneyAvailable;

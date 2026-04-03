@@ -400,9 +400,9 @@ export async function main(ns) {
         // Check alert conditions
         const money = srv.moneyAvailable;
         
-        // Money warnings
+        // Money warnings - only show warning if NOT in critical state
         const moneyCritical = moneyPct < MONEY_CRIT;
-        const moneyWarning = moneyPct < MONEY_WARN;
+        const moneyWarning = !moneyCritical && moneyPct < MONEY_WARN;
         
         if (moneyCritical && !alertState.bankruptcy) {
             ns.tprint(`CRITICAL: Bankruptcy on ${target} (${(moneyPct * 100).toFixed(1)}%)`);
@@ -416,9 +416,9 @@ export async function main(ns) {
             alertState.bankruptcyPrompted = false; // Reset when normalized
         }
         
-        // Security warnings
+        // Security warnings - only show warning if NOT in critical state
         const securityCritical = secAboveMin > SEC_CRIT;
-        const securityWarning = secAboveMin > SEC_WARN;
+        const securityWarning = !securityCritical && secAboveMin > SEC_WARN;
         
         if (securityCritical && !alertState.securityBreach) {
             ns.tprint(`CRITICAL: Security breach on ${target} (+${secAboveMin.toFixed(1)})`);

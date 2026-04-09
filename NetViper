@@ -423,6 +423,9 @@ export async function main(ns) {
         };
         log(`Threads: H${actualThreads.hack} G${actualThreads.grow} W${actualThreads.weaken}`);
 
+        // Draw HUD
+        drawHUD(target, actualThreads, srv);
+
         // Dispatch all three operations in parallel
         if (actualThreads.hack > 0) {
             await dispatch("hack", target, servers, actualThreads.hack);

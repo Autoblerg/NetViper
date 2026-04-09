@@ -341,14 +341,35 @@ export async function main(ns) {
             ? moneyHistory.reduce((a, b) => a + b, 0) / moneyHistory.length 
             : 0;
 
-        // Calculate worker distribution percentages
+        // Calculate worker distribution percentages with random fluctuation
         const total = threadCounts.hack + threadCounts.grow + threadCounts.weaken;
-        const hackPct = total > 0 ? Math.round((threadCounts.hack / total) * 100) : 0;
-        const growPct = total > 0 ? Math.round((threadCounts.grow / total) * 100) : 0;
-        const weakenPct = total > 0 ? Math.round((threadCounts.weaken / total) * 100) : 0;
-
-        ns.clearLog();
-        ns.print(`target_server:${target}`);
+        if (total > 0) {
+            const baseHack = (threadCounts.hack / total) * 100;
+            const baseGrow = (threadCounts.grow / total) * 100;
+            const baseWeaken = (threadCounts.weaken / total) * 100;
+            
+            // Add random fluctuation (±5%)
+            const fluctuate = (Math.random() - 0.5) * 10;
+            let hackPct = Math.max(0, baseHack + fluctuate);
+            let growPct = Math.max(0, baseGrow + fluctuate);
+            let weakenPct = Math.max(0, baseWeaken + fluctuate);
+            
+            // Normalize to 100%
+            const newTotal = hackPct + growPct + weakenPct;
+            if (newTotal > 0) {
+                hackPct = Math.round((hackPct / newTotal) * 100);
+                growPct = Math.round((growPct / newTotal) * 100);
+                weakenPct = 100 - hackPct - growPct;
+            }
+        }
+        
+        ns.print(`status:stable`);
+        ns.print(`$/s:${formatMoney(moneyPerSec)}`);
+        if (total > 0) {
+            ns.print(`hack:${hackPct}%`);
+            ns.print(`grow:${growPct}%`);
+            ns.print(`weaken:${weakenPct}%`);
+        }
         if (srv) {
             ns.print(`server_security:${srv.hackDifficulty.toFixed(1)}/${srv.minDifficulty}`);
             ns.print(`server_money:${(moneyPct * 100).toFixed(1)}%`);
@@ -356,18 +377,7 @@ export async function main(ns) {
             ns.print(`server_security:--/--`);
             ns.print(`server_money:--%`);
         }
-        // Status indicators
-        ns.print(`status:stable`);
-        ns.print(`$/s:${formatMoney(moneyPerSec)}`);
-        ns.print(`hack:${hackPct}%`);
-        ns.print(`grow:${growPct}%`);
-        ns.print(`weaken:${weakenPct}%`);
         ns.print(`backdoor:${backdoorTarget}`);
-        if (backdoorPID > 0 && ns.isRunning(backdoorPID)) {
-            const bdElapsed = now - backdoorStartTime;
-            const pct = Math.min(100, (bdElapsed / backdoorExpectedTime) * 100);
-            ns.print(`backdoor_progress:${pct.toFixed(1)}%`);
-        }
     }
 
     ensureWorkersHome();

@@ -31,15 +31,18 @@ export async function main(ns) {
         "logger.js": `/** @param {NS} ns **/
 export async function main(ns) {
     const logFile = "logger.txt";
-    let logs = "";
+    let lastContent = "";
     
     while (true) {
-        const newLogs = ns.read(logFile);
-        if (newLogs && newLogs !== logs) {
-            logs = newLogs;
-            ns.print(logs);
+        const content = ns.read(logFile);
+        
+        // Show ALL content, no truncation
+        if (content !== lastContent) {
+            lastContent = content;
+            ns.clearLog();
+            ns.print(content);
         }
-        await ns.sleep(100);
+        await ns.sleep(50);
     }
 }`
     };
@@ -55,12 +58,13 @@ export async function main(ns) {
     function log(msg) {
         const timestamp = new Date().toISOString().slice(11, 23);
         logBuffer += `[${timestamp}] ${msg}\n`;
-        // Keep log buffer manageable
-        if (logBuffer.length > 10000) logBuffer = logBuffer.slice(-5000);
+        // Keep log buffer larger for more history
+        if (logBuffer.length > 50000) logBuffer = logBuffer.slice(-25000);
     }
     
     function flushLogs() {
-        ns.write(logFile, logBuffer, "a");
+        // Write current buffer to file (overwrite mode)
+        ns.write(logFile, logBuffer, "w");
     }
 
     const scripts = { hack: "hack.js", grow: "grow.js", weaken: "weaken.js" };
@@ -69,20 +73,29 @@ export async function main(ns) {
         grow: ns.getScriptRam(scripts.grow),
         weaken: ns.getScriptRam(scripts.weaken)
     };
+    log(`RAM per thread: hack=${ram.hack}GB, grow=${ram.grow}GB, weaken=${ram.weaken}GB`);
 
     const seenRoot = new Set();
+    log(`Initialized seenRoot: []`);
     const seenBackdoor = new Set();
+    log(`Initialized seenBackdoor: []`);
     const hasScripts = new Set();
+    log(`Initialized hasScripts: []`);
     let moneyHistory = []; // for smoothed money/s calculation
     let lastMoneyCheck = 0;
     let lastMoneyValue = 0;
     let backdoorCursor = 0;
+    log(`Initialized backdoorCursor: 0`);
     let lastTarget = "";
+    log(`Initialized lastTarget: ""`);
     let lastBackdoorTarget = "none";
+    log(`Initialized lastBackdoorTarget: "none"`);
     let backdoorTarget = "idle";
+    log(`Initialized backdoorTarget: "idle"`);
     let backdoorStartTime = 0;
     let backdoorExpectedTime = 0;
     let backdoorPID = 0;
+    log(`Initialized backdoorPID: 0`);
 
     const scanAll = () => {
         const out = new Set(["home"]), stack = ["home"];
@@ -217,6 +230,7 @@ export async function main(ns) {
     }
 
     async function dispatch(process, target, servers, needThreads) {
+        log(`dispatch: ${process} x${needThreads} on ${target}`);
         // Get all running scripts on all servers to avoid killing workers
         const runningScripts = new Map(); // server -> Map(script -> threads)
         
@@ -224,6 +238,7 @@ export async function main(ns) {
             if (!ns.hasRootAccess(s)) continue;
             runningScripts.set(s, new Map());
             const processes = ns.ps(s);
+            log(`dispatch: scanning ${s} - ${processes.length} processes`);
             for (const p of processes) {
                 if (p.filename === scripts[process] && p.args[0] === target) {
                     const current = runningScripts.get(s).get(process) || 0;
@@ -242,11 +257,13 @@ export async function main(ns) {
             const maxThreads = freeThreads(s, process, reserve);
             const currentThreads = runningScripts.get(s).get(process) || 0;
             const canAdd = maxThreads - currentThreads;
+            log(`dispatch: ${s} - maxThreads=${maxThreads}, current=${currentThreads}, canAdd=${canAdd}`);
             
             if (canAdd <= 0) continue;
             
             const toAdd = Math.min(canAdd, remaining);
             await ensureScripts(s);
+            log(`dispatch: EXEC ${scripts[process]} on ${s} x${toAdd} threads`);
             ns.exec(scripts[process], s, toAdd, target);
             remaining -= toAdd;
         }
@@ -254,11 +271,13 @@ export async function main(ns) {
 
     function calcNeeds(target) {
         const srv = ns.getServer(target);
+        log(`calcNeeds: ${target} - money=${srv.moneyAvailable}/${srv.moneyMax}, sec=${srv.hackDifficulty}/${srv.minDifficulty}`);
         
         // Weaken: only reduce security to min + SEC_MARGIN (keep buffer above min)
         const targetSec = srv.minDifficulty + SEC_MARGIN;
         const secToReduce = Math.max(0, srv.hackDifficulty - targetSec);
         const weakenThreads = Math.max(1, Math.ceil(secToReduce / ns.weakenAnalyze(1, 1)));
+        log(`calcNeeds: weaken - targetSec=${targetSec}, secToReduce=${secToReduce.toFixed(2)}, threads=${weakenThreads}`);
 
         // Grow: only grow to MONEY_OK (75%), not 100%
         const targetMoney = srv.moneyMax * MONEY_OK;
@@ -266,6 +285,7 @@ export async function main(ns) {
         const growThreads = growFactor > 1 
             ? Math.max(1, Math.ceil(ns.growthAnalyze(target, growFactor, 1)))
             : 0;
+        log(`calcNeeds: grow - targetMoney=${targetMoney}, growFactor=${growFactor.toFixed(3)}, threads=${growThreads}`);
 
         // Hack: max threads for income (steal 20% of current money)
         const take = srv.moneyAvailable * HACK_FRAC;
@@ -273,19 +293,30 @@ export async function main(ns) {
             const th = ns.hackAnalyzeThreads(target, take);
             return (isFinite(th) && th > 0) ? Math.ceil(th) : 1;
         })();
+        log(`calcNeeds: hack - take=${take}, threads=${hackThreads}`);
 
-        return { weakenThreads, growThreads, hackThreads };
+        const result = { weakenThreads, growThreads, hackThreads };
+        log(`calcNeeds result: ${JSON.stringify(result)}`);
+        return result;
     }
 
     function pickTarget(servers) {
         const hackLevel = ns.getHackingLevel();
+        log(`pickTarget: checking ${servers.length} servers, hackLevel=${hackLevel}`);
         let best = null, bestVal = 0;
         for (const s of servers) {
             if (!ns.hasRootAccess(s) || s === "home") continue;
-            if (ns.getServerRequiredHackingLevel(s) > hackLevel) continue;
-            const val = ns.getServerMaxMoney(s) / (ns.getServerMinSecurityLevel(s) + 1);
+            if (ns.getServerRequiredHackingLevel(s) > hackLevel) {
+                log(`pickTarget: ${s} skipped - req level ${ns.getServerRequiredHackingLevel(s)} > ${hackLevel}`);
+                continue;
+            }
+            const maxMoney = ns.getServerMaxMoney(s);
+            const minSec = ns.getServerMinSecurityLevel(s);
+            const val = maxMoney / (minSec + 1);
+            log(`pickTarget: ${s} - maxMoney=${maxMoney}, minSec=${minSec}, val=${val}`);
             if (val > bestVal) { bestVal = val; best = s; }
         }
+        log(`pickTarget result: ${best} (val=${bestVal})`);
         return best;
     }
 
@@ -393,7 +424,7 @@ export async function main(ns) {
         
         if (!target) {
             currentProcess = "idle";
-            drawHUD("none", { hack: 0, grow: 0, weaken: 0 });
+            log(`No target found, state: idle`);
             await ns.sleep(HUD_REFRESH);
             continue;
         }
@@ -436,8 +467,8 @@ export async function main(ns) {
         };
         log(`Actual threads: hack=${actualThreads.hack}, grow=${actualThreads.grow}, weaken=${actualThreads.weaken}`);
 
-        // Draw HUD every cycle
-        drawHUD(target, actualThreads, srv);
+        // Draw HUD every cycle (disabled - logs contain all info)
+        // drawHUD(target, actualThreads, srv);
 
         // Dispatch all three operations in parallel
         if (actualThreads.hack > 0) {

@@ -31,18 +31,24 @@ export async function main(ns) {
         "logger.js": `/** @param {NS} ns **/
 export async function main(ns) {
     const logFile = "logger.txt";
-    let lastContent = "";
+    let lastSize = 0;
     
     while (true) {
         const content = ns.read(logFile);
-        
-        // Show ALL content, no truncation
-        if (content !== lastContent) {
-            lastContent = content;
-            ns.clearLog();
-            ns.print(content);
+        if (!content) {
+            await ns.sleep(200);
+            continue;
         }
-        await ns.sleep(50);
+        
+        // Only update if file grew (avoids constant redraws)
+        if (content.length !== lastSize) {
+            lastSize = content.length;
+            // Only show last 30 lines to prevent crash
+            const lines = content.split('\\n').slice(-30).join('\\n');
+            ns.clearLog();
+            ns.print(lines);
+        }
+        await ns.sleep(200);
     }
 }`
     };
@@ -52,14 +58,14 @@ export async function main(ns) {
     }
 
     // Logger functions
+    // Logger - minimal output
     const logFile = "logger.txt";
     let logBuffer = "";
     
     function log(msg) {
-        const timestamp = new Date().toISOString().slice(11, 23);
-        logBuffer += `[${timestamp}] ${msg}\n`;
-        // Keep log buffer larger for more history
-        if (logBuffer.length > 50000) logBuffer = logBuffer.slice(-25000);
+        const ts = Date.now() % 100000; // Simple counter
+        logBuffer += `[${ts}] ${msg}\n`;
+        if (logBuffer.length > 800) logBuffer = logBuffer.slice(-400);
     }
     
     function flushLogs() {
@@ -73,29 +79,20 @@ export async function main(ns) {
         grow: ns.getScriptRam(scripts.grow),
         weaken: ns.getScriptRam(scripts.weaken)
     };
-    log(`RAM per thread: hack=${ram.hack}GB, grow=${ram.grow}GB, weaken=${ram.weaken}GB`);
+    log(`RAM: ${ram.hack}/${ram.grow}/${ram.weaken}`);
 
     const seenRoot = new Set();
-    log(`Initialized seenRoot: []`);
     const seenBackdoor = new Set();
-    log(`Initialized seenBackdoor: []`);
     const hasScripts = new Set();
-    log(`Initialized hasScripts: []`);
-    let moneyHistory = []; // for smoothed money/s calculation
+    let moneyHistory = [];
     let lastMoneyCheck = 0;
     let lastMoneyValue = 0;
     let backdoorCursor = 0;
-    log(`Initialized backdoorCursor: 0`);
     let lastTarget = "";
-    log(`Initialized lastTarget: ""`);
-    let lastBackdoorTarget = "none";
-    log(`Initialized lastBackdoorTarget: "none"`);
     let backdoorTarget = "idle";
-    log(`Initialized backdoorTarget: "idle"`);
     let backdoorStartTime = 0;
     let backdoorExpectedTime = 0;
     let backdoorPID = 0;
-    log(`Initialized backdoorPID: 0`);
 
     const scanAll = () => {
         const out = new Set(["home"]), stack = ["home"];
@@ -132,7 +129,6 @@ export async function main(ns) {
 
     async function root(server) {
         if (server === "home" || ns.hasRootAccess(server)) return;
-        log(`Attempting root on ${server}`);
         
         if (ns.fileExists("BruteSSH.exe")) ns.brutessh(server);
         if (ns.fileExists("FTPCrack.exe")) ns.ftpcrack(server);
@@ -142,7 +138,7 @@ export async function main(ns) {
         if (ns.getServerNumPortsRequired(server) <= ns.getServer(server).openPortCount) {
             ns.nuke(server);
             if (!seenRoot.has(server)) {
-                log(`Root gained on ${server}`);
+                log(`Root: ${server}`);
                 ns.tprint(`root gained on ${server}`);
                 seenRoot.add(server);
             }
@@ -158,11 +154,9 @@ export async function main(ns) {
     async function startBackdoor(servers) {
         // Check if backdoor operation is in progress
         if (backdoorTarget !== "idle") {
-            // Check if enough time has passed (approximate hack time)
             if (performance.now() - backdoorStartTime >= backdoorExpectedTime * 1.5) {
-                // Timeout - mark as done
                 seenBackdoor.add(backdoorTarget);
-                log(`Backdoor timeout on ${backdoorTarget}`);
+                log(`BD timeout: ${backdoorTarget}`);
                 backdoorCursor++;
                 backdoorTarget = "idle";
                 backdoorPID = 0;
@@ -184,22 +178,17 @@ export async function main(ns) {
             const path = bfsPath(s);
             if (!path) continue;
 
-            // Start backdoor operation
-            log(`Installing backdoor on ${s}`);
+            log(`BD: ${s}`);
             backdoorTarget = s;
             backdoorStartTime = performance.now();
             backdoorExpectedTime = ns.getHackTime(s);
             
-            // Install backdoor directly
-            log(`Connecting to path: ${path.join(" -> ")}`);
             ns.tprint(`Installing backdoor on ${s}`);
             for (const hop of path) ns.singularity.connect(hop);
             await ns.singularity.installBackdoor();
             ns.singularity.connect("home");
-            log(`Installed backdoor on ${s}`);
             ns.tprint(`Installed backdoor on ${s}`);
             
-            // Mark as complete
             seenBackdoor.add(s);
             backdoorCursor++;
             backdoorTarget = "idle";
@@ -230,7 +219,6 @@ export async function main(ns) {
     }
 
     async function dispatch(process, target, servers, needThreads) {
-        log(`dispatch: ${process} x${needThreads} on ${target}`);
         // Get all running scripts on all servers to avoid killing workers
         const runningScripts = new Map(); // server -> Map(script -> threads)
         
@@ -238,7 +226,6 @@ export async function main(ns) {
             if (!ns.hasRootAccess(s)) continue;
             runningScripts.set(s, new Map());
             const processes = ns.ps(s);
-            log(`dispatch: scanning ${s} - ${processes.length} processes`);
             for (const p of processes) {
                 if (p.filename === scripts[process] && p.args[0] === target) {
                     const current = runningScripts.get(s).get(process) || 0;
@@ -257,13 +244,12 @@ export async function main(ns) {
             const maxThreads = freeThreads(s, process, reserve);
             const currentThreads = runningScripts.get(s).get(process) || 0;
             const canAdd = maxThreads - currentThreads;
-            log(`dispatch: ${s} - maxThreads=${maxThreads}, current=${currentThreads}, canAdd=${canAdd}`);
             
             if (canAdd <= 0) continue;
             
             const toAdd = Math.min(canAdd, remaining);
             await ensureScripts(s);
-            log(`dispatch: EXEC ${scripts[process]} on ${s} x${toAdd} threads`);
+            log(`Exec ${process} x${toAdd} on ${s}`);
             ns.exec(scripts[process], s, toAdd, target);
             remaining -= toAdd;
         }
@@ -271,52 +257,34 @@ export async function main(ns) {
 
     function calcNeeds(target) {
         const srv = ns.getServer(target);
-        log(`calcNeeds: ${target} - money=${srv.moneyAvailable}/${srv.moneyMax}, sec=${srv.hackDifficulty}/${srv.minDifficulty}`);
-        
-        // Weaken: only reduce security to min + SEC_MARGIN (keep buffer above min)
         const targetSec = srv.minDifficulty + SEC_MARGIN;
         const secToReduce = Math.max(0, srv.hackDifficulty - targetSec);
         const weakenThreads = Math.max(1, Math.ceil(secToReduce / ns.weakenAnalyze(1, 1)));
-        log(`calcNeeds: weaken - targetSec=${targetSec}, secToReduce=${secToReduce.toFixed(2)}, threads=${weakenThreads}`);
 
-        // Grow: only grow to MONEY_OK (75%), not 100%
         const targetMoney = srv.moneyMax * MONEY_OK;
         const growFactor = targetMoney / Math.max(1, srv.moneyAvailable);
         const growThreads = growFactor > 1 
             ? Math.max(1, Math.ceil(ns.growthAnalyze(target, growFactor, 1)))
             : 0;
-        log(`calcNeeds: grow - targetMoney=${targetMoney}, growFactor=${growFactor.toFixed(3)}, threads=${growThreads}`);
 
-        // Hack: max threads for income (steal 20% of current money)
         const take = srv.moneyAvailable * HACK_FRAC;
         const hackThreads = (() => {
             const th = ns.hackAnalyzeThreads(target, take);
             return (isFinite(th) && th > 0) ? Math.ceil(th) : 1;
         })();
-        log(`calcNeeds: hack - take=${take}, threads=${hackThreads}`);
 
-        const result = { weakenThreads, growThreads, hackThreads };
-        log(`calcNeeds result: ${JSON.stringify(result)}`);
-        return result;
+        return { weakenThreads, growThreads, hackThreads };
     }
 
     function pickTarget(servers) {
         const hackLevel = ns.getHackingLevel();
-        log(`pickTarget: checking ${servers.length} servers, hackLevel=${hackLevel}`);
         let best = null, bestVal = 0;
         for (const s of servers) {
             if (!ns.hasRootAccess(s) || s === "home") continue;
-            if (ns.getServerRequiredHackingLevel(s) > hackLevel) {
-                log(`pickTarget: ${s} skipped - req level ${ns.getServerRequiredHackingLevel(s)} > ${hackLevel}`);
-                continue;
-            }
-            const maxMoney = ns.getServerMaxMoney(s);
-            const minSec = ns.getServerMinSecurityLevel(s);
-            const val = maxMoney / (minSec + 1);
-            log(`pickTarget: ${s} - maxMoney=${maxMoney}, minSec=${minSec}, val=${val}`);
+            if (ns.getServerRequiredHackingLevel(s) > hackLevel) continue;
+            const val = ns.getServerMaxMoney(s) / (ns.getServerMinSecurityLevel(s) + 1);
             if (val > bestVal) { bestVal = val; best = s; }
         }
-        log(`pickTarget result: ${best} (val=${bestVal})`);
         return best;
     }
 
@@ -408,19 +376,12 @@ export async function main(ns) {
     ns.ui.openTail();
 
     while (true) {
-        log(`=== Cycle start ===`);
         const servers = scanAll();
-        log(`Found ${servers.length} servers`);
         
-        for (const s of servers) {
-            log(`Root check: ${s}`);
-            await root(s);
-        }
-
+        for (const s of servers) await root(s);
         await startBackdoor(servers);
-
+        
         const target = pickTarget(servers);
-        log(`Target selected: ${target}`);
         
         if (!target) {
             currentProcess = "idle";
@@ -438,53 +399,41 @@ export async function main(ns) {
 
         // Calculate threads needed for all three operations based on server state
         const srv = ns.getServer(target);
-        log(`Server ${target}: money=${srv.moneyAvailable}/${srv.moneyMax} (${((srv.moneyAvailable/srv.moneyMax)*100).toFixed(1)}%), sec=${srv.hackDifficulty}/${srv.minDifficulty}`);
         
         // Get ideal thread counts for each operation from calcNeeds
         const { weakenThreads, growThreads, hackThreads } = calcNeeds(target);
-        log(`Ideal threads: hack=${hackThreads}, grow=${growThreads}, weaken=${weakenThreads}`);
 
         // Get available threads for each type
         const availableHack = totalFreeThreads(servers, "hack");
         const availableGrow = totalFreeThreads(servers, "grow");
         const availableWeaken = totalFreeThreads(servers, "weaken");
-        log(`Available threads: hack=${availableHack}, grow=${availableGrow}, weaken=${availableWeaken}`);
 
         // Scale each proportionally to available RAM while keeping ratios
-        // This ensures we use all available RAM efficiently
-        const ratioHack = availableHack / Math.max(1, hackThreads);
-        const ratioGrow = availableGrow / Math.max(1, growThreads);
-        const ratioWeaken = availableWeaken / Math.max(1, weakenThreads);
-        
-        // Use the minimum ratio to scale all down proportionally
-        const minRatio = Math.min(ratioHack, ratioGrow, ratioWeaken, 1);
-        log(`Scaling ratio: ${minRatio.toFixed(3)}`);
+        const minRatio = Math.min(
+            availableHack / Math.max(1, hackThreads),
+            availableGrow / Math.max(1, growThreads),
+            availableWeaken / Math.max(1, weakenThreads),
+            1
+        );
 
         const actualThreads = {
             hack: Math.floor(hackThreads * minRatio),
             grow: Math.floor(growThreads * minRatio),
             weaken: Math.floor(weakenThreads * minRatio)
         };
-        log(`Actual threads: hack=${actualThreads.hack}, grow=${actualThreads.grow}, weaken=${actualThreads.weaken}`);
-
-        // Draw HUD every cycle (disabled - logs contain all info)
-        // drawHUD(target, actualThreads, srv);
+        log(`Threads: H${actualThreads.hack} G${actualThreads.grow} W${actualThreads.weaken}`);
 
         // Dispatch all three operations in parallel
         if (actualThreads.hack > 0) {
-            log(`Dispatching hack: ${actualThreads.hack} threads on ${target}`);
             await dispatch("hack", target, servers, actualThreads.hack);
         }
         if (actualThreads.grow > 0) {
-            log(`Dispatching grow: ${actualThreads.grow} threads on ${target}`);
             await dispatch("grow", target, servers, actualThreads.grow);
         }
         if (actualThreads.weaken > 0) {
-            log(`Dispatching weaken: ${actualThreads.weaken} threads on ${target}`);
             await dispatch("weaken", target, servers, actualThreads.weaken);
         }
 
-        log(`=== Cycle end ===`);
         flushLogs();
         
         await ns.sleep(HUD_REFRESH);

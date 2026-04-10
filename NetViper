@@ -96,7 +96,7 @@ export async function main(ns) {
     
     // Smooth fluctuating display values (drift slowly)
     let displayOffset = 0;
-    const DISPLAY_CHANGE_RATE = 0.15; // How fast display drifts
+    const DISPLAY_CHANGE_RATE = 0.5; // Speed up drift
 
     const scanAll = () => {
         const out = new Set(["home"]), stack = ["home"];
@@ -385,6 +385,7 @@ export async function main(ns) {
             }
         }
         
+        ns.clearLog(); // Clear previous HUD before drawing new one
         ns.print(`status:stable`);
         ns.print(`$/s:${formatMoney(moneyPerSec)}`);
         ns.print(`hack:${displayHack}%`);

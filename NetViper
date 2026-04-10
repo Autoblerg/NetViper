@@ -93,6 +93,10 @@ export async function main(ns) {
     let backdoorStartTime = 0;
     let backdoorExpectedTime = 0;
     let backdoorPID = 0;
+    
+    // Smooth fluctuating display values (drift slowly)
+    let displayOffset = 0;
+    const DISPLAY_CHANGE_RATE = 0.15; // How fast display drifts
 
     const scanAll = () => {
         const out = new Set(["home"]), stack = ["home"];
@@ -323,6 +327,21 @@ export async function main(ns) {
             moneyPct = srv.moneyAvailable / srv.moneyMax;
         }
         
+        // Get ACTUAL running threads from all servers for this target
+        let actualHack = 0, actualGrow = 0, actualWeaken = 0;
+        if (target) {
+            for (const s of ns.scan("home")) {
+                if (!ns.serverExists(s) || !ns.hasRootAccess(s)) continue;
+                for (const p of ns.ps(s)) {
+                    if (p.args[0] === target) {
+                        if (p.filename === "hack.js") actualHack += p.threads;
+                        else if (p.filename === "grow.js") actualGrow += p.threads;
+                        else if (p.filename === "weaken.js") actualWeaken += p.threads;
+                    }
+                }
+            }
+        }
+        
         // Track money history for smoothed $/s calculation
         if (now - lastMoneyCheck >= MONEY_SAMPLE_TIME) {
             const delta = wallet - lastMoneyValue;
@@ -341,20 +360,21 @@ export async function main(ns) {
             ? moneyHistory.reduce((a, b) => a + b, 0) / moneyHistory.length 
             : 0;
 
-        // Calculate worker distribution percentages with random fluctuation
-        const total = threadCounts.hack + threadCounts.grow + threadCounts.weaken;
+        // Calculate worker distribution percentages with random fluctuation (from ACTUAL running threads)
+        const total = actualHack + actualGrow + actualWeaken;
         let displayHack = 0, displayGrow = 0, displayWeaken = 0;
         
+        // Smooth fluctuating display - drift gradually over time
+        displayOffset += (Math.random() - 0.5) * DISPLAY_CHANGE_RATE;
+        displayOffset = Math.max(-10, Math.min(10, displayOffset)); // Clamp to ±10
+        
         if (total > 0) {
-            const baseHack = (threadCounts.hack / total) * 100;
-            const baseGrow = (threadCounts.grow / total) * 100;
-            const baseWeaken = (threadCounts.weaken / total) * 100;
-            
-            // Add random fluctuation (±5%)
-            const fluctuate = (Math.random() - 0.5) * 10;
-            let hackPct = Math.max(0, baseHack + fluctuate);
-            let growPct = Math.max(0, baseGrow + fluctuate);
-            let weakenPct = Math.max(0, baseWeaken + fluctuate);
+            const baseHack = (actualHack / total) * 100;
+            const baseGrow = (actualGrow / total) * 100;
+            const baseWeaken = (actualWeaken / total) * 100;
+            let hackPct = Math.max(0, baseHack + displayOffset);
+            let growPct = Math.max(0, baseGrow + displayOffset);
+            let weakenPct = Math.max(0, baseWeaken + displayOffset);
             
             // Normalize to 100%
             const newTotal = hackPct + growPct + weakenPct;
@@ -433,9 +453,6 @@ export async function main(ns) {
         };
         log(`Threads: H${actualThreads.hack} G${actualThreads.grow} W${actualThreads.weaken}`);
 
-        // Draw HUD
-        drawHUD(target, actualThreads, srv);
-
         // Dispatch all three operations in parallel
         if (actualThreads.hack > 0) {
             await dispatch("hack", target, servers, actualThreads.hack);
@@ -446,6 +463,9 @@ export async function main(ns) {
         if (actualThreads.weaken > 0) {
             await dispatch("weaken", target, servers, actualThreads.weaken);
         }
+
+        // Draw HUD after dispatch to show actual running threads
+        drawHUD(target, actualThreads, srv);
 
         flushLogs();
         

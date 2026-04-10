@@ -466,10 +466,11 @@ export async function main(ns) {
         }
 
         // Draw HUD after dispatch to show actual running threads
+        // Only draw once per 500ms to prevent stacking
         drawHUD(target, actualThreads, srv);
 
         flushLogs();
         
-        await ns.sleep(HUD_REFRESH);
+        await ns.sleep(500); // Fixed 500ms to prevent HUD stacking
     }
 }

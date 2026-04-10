@@ -96,7 +96,7 @@ export async function main(ns) {
     
     // Smooth fluctuating display values (drift slowly)
     let displayOffset = 0;
-    const DISPLAY_CHANGE_RATE = 0.15; // How fast display drifts
+    const DISPLAY_CHANGE_RATE = 0.5; // Speed up drift
 
     const scanAll = () => {
         const out = new Set(["home"]), stack = ["home"];
@@ -385,7 +385,18 @@ export async function main(ns) {
             }
         }
         
-        ns.print(`status:stable`);
+        ns.clearLog(); // Clear previous HUD before drawing new one
+        
+        // Determine status
+        let status = "stable";
+        if (srv) {
+            const secPct = srv.hackDifficulty / srv.minDifficulty;
+            const moneyPctRaw = moneyPct * 100;
+            if (secPct > 2.0) status = "security_breach"; // High security
+            else if (moneyPctRaw < 10) status = "bankrupt"; // Low money
+        }
+        
+        ns.print(`status:${status}`);
         ns.print(`$/s:${formatMoney(moneyPerSec)}`);
         ns.print(`hack:${displayHack}%`);
         ns.print(`grow:${displayGrow}%`);
@@ -465,10 +476,11 @@ export async function main(ns) {
         }
 
         // Draw HUD after dispatch to show actual running threads
+        // Only draw once per 500ms to prevent stacking
         drawHUD(target, actualThreads, srv);
 
         flushLogs();
         
-        await ns.sleep(HUD_REFRESH);
+        await ns.sleep(100); // 100ms refresh for smooth HUD
     }
 }

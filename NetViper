@@ -386,7 +386,17 @@ export async function main(ns) {
         }
         
         ns.clearLog(); // Clear previous HUD before drawing new one
-        ns.print(`status:stable`);
+        
+        // Determine status
+        let status = "stable";
+        if (srv) {
+            const secPct = srv.hackDifficulty / srv.minDifficulty;
+            const moneyPctRaw = moneyPct * 100;
+            if (secPct > 2.0) status = "security_breach"; // High security
+            else if (moneyPctRaw < 10) status = "bankrupt"; // Low money
+        }
+        
+        ns.print(`status:${status}`);
         ns.print(`$/s:${formatMoney(moneyPerSec)}`);
         ns.print(`hack:${displayHack}%`);
         ns.print(`grow:${displayGrow}%`);
@@ -471,6 +481,6 @@ export async function main(ns) {
 
         flushLogs();
         
-        await ns.sleep(500); // Fixed 500ms to prevent HUD stacking
+        await ns.sleep(100); // 100ms refresh for smooth HUD
     }
 }

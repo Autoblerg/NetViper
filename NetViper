@@ -360,28 +360,35 @@ export async function main(ns) {
             ? moneyHistory.reduce((a, b) => a + b, 0) / moneyHistory.length 
             : 0;
 
-        // Calculate worker distribution percentages with random fluctuation (from ACTUAL running threads)
+        // Calculate worker distribution percentages with independent fluctuation per process
         const total = actualHack + actualGrow + actualWeaken;
         let displayHack = 0, displayGrow = 0, displayWeaken = 0;
+        let fluHack = 0, fluGrow = 0, fluWeaken = 0;
         
-        // Smooth fluctuating display - drift gradually over time
-        displayOffset += (Math.random() - 0.5) * DISPLAY_CHANGE_RATE;
-        displayOffset = Math.max(-10, Math.min(10, displayOffset)); // Clamp to ±10
+        // Each process gets independent random drift
+        const fluctuateHack = displayOffset + (Math.random() - 0.5) * DISPLAY_CHANGE_RATE;
+        const fluctuateGrow = displayOffset + (Math.random() - 0.5) * DISPLAY_CHANGE_RATE;
+        const fluctuateWeaken = displayOffset + (Math.random() - 0.5) * DISPLAY_CHANGE_RATE;
         
         if (total > 0) {
             const baseHack = (actualHack / total) * 100;
             const baseGrow = (actualGrow / total) * 100;
             const baseWeaken = (actualWeaken / total) * 100;
-            let hackPct = Math.max(0, baseHack + displayOffset);
-            let growPct = Math.max(0, baseGrow + displayOffset);
-            let weakenPct = Math.max(0, baseWeaken + displayOffset);
             
-            // Normalize to 100%
+            // Actual percentages (normalized to 100%)
+            displayHack = Math.round(baseHack);
+            displayGrow = Math.round(baseGrow);
+            displayWeaken = 100 - displayHack - displayGrow;
+            
+            // Fluctuated values (normalized separately)
+            let hackPct = Math.max(0, baseHack + fluctuateHack);
+            let growPct = Math.max(0, baseGrow + fluctuateGrow);
+            let weakenPct = Math.max(0, baseWeaken + fluctuateWeaken);
             const newTotal = hackPct + growPct + weakenPct;
             if (newTotal > 0) {
-                displayHack = Math.round((hackPct / newTotal) * 100);
-                displayGrow = Math.round((growPct / newTotal) * 100);
-                displayWeaken = 100 - displayHack - displayGrow;
+                fluHack = Math.round((hackPct / newTotal) * 100);
+                fluGrow = Math.round((growPct / newTotal) * 100);
+                fluWeaken = 100 - fluHack - fluGrow;
             }
         }
         
@@ -398,14 +405,15 @@ export async function main(ns) {
         
         ns.print(`status:${status}`);
         ns.print(`$/s:${formatMoney(moneyPerSec)}`);
-        ns.print(`hack:${displayHack}%`);
-        ns.print(`grow:${displayGrow}%`);
-        ns.print(`weaken:${displayWeaken}%`);
+        ns.print(`hack:${displayHack}%(${fluHack}%)`);
+        ns.print(`grow:${displayGrow}%(${fluGrow}%)`);
+        ns.print(`weaken:${displayWeaken}%(${fluWeaken}%)`);
         if (srv) {
-            ns.print(`server_security:${srv.hackDifficulty.toFixed(1)}/${srv.minDifficulty}`);
+            const secDiff = (srv.hackDifficulty - srv.minDifficulty).toFixed(1);
+            ns.print(`server_security:+${secDiff}`);
             ns.print(`server_money:${(moneyPct * 100).toFixed(1)}%`);
         } else {
-            ns.print(`server_security:--/--`);
+            ns.print(`server_security:--`);
             ns.print(`server_money:--%`);
         }
         ns.print(`backdoor:${backdoorTarget}`);

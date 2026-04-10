@@ -93,6 +93,10 @@ export async function main(ns) {
     let backdoorStartTime = 0;
     let backdoorExpectedTime = 0;
     let backdoorPID = 0;
+    
+    // Smooth fluctuating display values (drift slowly)
+    let displayOffset = 0;
+    const DISPLAY_CHANGE_RATE = 0.15; // How fast display drifts
 
     const scanAll = () => {
         const out = new Set(["home"]), stack = ["home"];
@@ -360,16 +364,17 @@ export async function main(ns) {
         const total = actualHack + actualGrow + actualWeaken;
         let displayHack = 0, displayGrow = 0, displayWeaken = 0;
         
+        // Smooth fluctuating display - drift gradually over time
+        displayOffset += (Math.random() - 0.5) * DISPLAY_CHANGE_RATE;
+        displayOffset = Math.max(-10, Math.min(10, displayOffset)); // Clamp to ±10
+        
         if (total > 0) {
             const baseHack = (actualHack / total) * 100;
             const baseGrow = (actualGrow / total) * 100;
             const baseWeaken = (actualWeaken / total) * 100;
-            
-            // Add random fluctuation (±5%)
-            const fluctuate = (Math.random() - 0.5) * 10;
-            let hackPct = Math.max(0, baseHack + fluctuate);
-            let growPct = Math.max(0, baseGrow + fluctuate);
-            let weakenPct = Math.max(0, baseWeaken + fluctuate);
+            let hackPct = Math.max(0, baseHack + displayOffset);
+            let growPct = Math.max(0, baseGrow + displayOffset);
+            let weakenPct = Math.max(0, baseWeaken + displayOffset);
             
             // Normalize to 100%
             const newTotal = hackPct + growPct + weakenPct;
